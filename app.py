@@ -1,8 +1,9 @@
 """Kisan Slot v4
 Farmer registration (Indian mobile numbers only), slot booking, live queue, real SMS,
 procurement tracking and payments. SQLite on your laptop, PostgreSQL when DATABASE_URL is set."""
-import os, re, random, secrets, sqlite3, time, base64, urllib.request, urllib.parse, datetime as dt
+import os, re, json, random, secrets, sqlite3, time, base64, urllib.request, urllib.parse, urllib.error, datetime as dt
 from flask import Flask, request, jsonify, g
+from markupsafe import escape
 from page import INDEX_HTML
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -11,10 +12,16 @@ DB = os.environ.get("DB_PATH", "procure.db")
 STAFF_PIN = os.environ.get("STAFF_PIN", "1234")
 PRODUCTION = os.environ.get("APP_ENV", "dev") == "production"
 SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "console").lower()      # console | fast2sms | twilio
+STARTUP_ERROR = None      # shown on the page (instead of crashing) when a setting is missing
 if PRODUCTION and STAFF_PIN == "1234":
-    raise SystemExit("Set a strong STAFF_PIN environment variable before running in production")
+    STARTUP_ERROR = "STAFF_PIN is not set. In Vercel open Settings > Environment Variables, add STAFF_PIN with a secret number (not 1234), then Redeploy."
+elif os.environ.get("VERCEL") and not PG:
+    STARTUP_ERROR = "DATABASE_URL is not set. In Vercel open Settings > Environment Variables, add DATABASE_URL with your Neon connection string (it starts with postgresql://), then Redeploy."
 if PG:
-    import psycopg2, psycopg2.extras
+    try:
+        import psycopg2, psycopg2.extras
+    except ImportError:
+        STARTUP_ERROR = "The psycopg2-binary package is missing. Make sure requirements.txt is in the top level of your GitHub repository, then Redeploy."
 
 OTP_TTL_SEC, OTP_COOLDOWN_SEC, OTP_MAX_TRIES = 600, 30, 5
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -128,16 +135,44 @@ def _post(url, data, headers):
     with urllib.request.urlopen(req, timeout=6) as r:
         return r.status, r.read().decode()
 
+F2S_REASONS = {
+    999: "Fast2SMS needs ONE wallet recharge of at least Rs 100 before its API can be used. Click ADD CREDIT in Fast2SMS, add Rs 100, then test again.",
+    416: "Your Fast2SMS wallet balance is too low. Click ADD CREDIT and add money.",
+    412: "Fast2SMS says the API key is wrong. Copy it again from Dev API > API Key and update FAST2SMS_KEY in Vercel (then Redeploy).",
+    413: "Your Fast2SMS API key is disabled. Check the API Key tab in Fast2SMS.",
+    411: "Fast2SMS says the mobile number is invalid.",
+    414: "Fast2SMS is blocking this server's IP address. Open Dev API > Security and remove any IP restriction.",
+    415: "Your Fast2SMS account is disabled. Contact Fast2SMS support.",
+    995: "Fast2SMS blocked this as spam (several SMS to the same number in a short time). Wait a few minutes and try again.",
+    407: "Fast2SMS rejected a word used in the message.",
+    417: "The message has characters Fast2SMS cannot send. Use plain English letters.",
+    408: "Fast2SMS says the Quick SMS route is not available for your account.",
+    409: "Fast2SMS says the Quick SMS route is not allowed for your account.",
+}
+
+def f2s_reason(body):
+    """Turn Fast2SMS's JSON reply into a plain sentence."""
+    try:
+        j = json.loads(body)
+        return F2S_REASONS.get(int(j.get("status_code", 0))) or str(j.get("message") or body)[:200]
+    except Exception:
+        return body[:200]
+
 def send_sms(phone, text):
-    """Sent immediately (not in a background thread) so it also works on Vercel."""
+    """Sent immediately (not in a background thread) so it also works on Vercel.
+    Returns (ok, detail) so callers can show the gateway's real answer."""
     print(f"[SMS -> {phone}] {text}")
-    if SMS_PROVIDER == "console": return
+    if SMS_PROVIDER == "console":
+        return True, "console mode: the message was only printed in the server log, no real SMS was sent"
     try:
         if SMS_PROVIDER == "fast2sms":
             status, resp = _post("https://www.fast2sms.com/dev/bulkV2",
-                                 {"route": "q", "message": text, "numbers": phone, "flash": "0"},
-                                 {"authorization": os.environ["FAST2SMS_KEY"]})
+                                 {"route": "q", "message": text, "numbers": phone},
+                                 {"authorization": os.environ["FAST2SMS_KEY"].strip()})
             ok = status < 300 and '"return":false' not in resp.replace(" ", "")
+            if not ok:
+                print(f"[SMS fast2sms -> {phone}] REJECTED: {resp[:200]}")
+                return False, f2s_reason(resp)
         elif SMS_PROVIDER == "twilio":
             sid, tok = os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"]
             auth = base64.b64encode(f"{sid}:{tok}".encode()).decode()
@@ -146,10 +181,19 @@ def send_sms(phone, text):
                                  {"Authorization": "Basic " + auth})
             ok = status < 300
         else:
-            return
-        print(f"[SMS {SMS_PROVIDER} -> {phone}] {'SENT' if ok else 'REJECTED'}: {resp[:150]}")
+            return False, f"Unknown SMS_PROVIDER '{SMS_PROVIDER}'"
+        print(f"[SMS {SMS_PROVIDER} -> {phone}] {'SENT' if ok else 'REJECTED'}: {resp[:200]}")
+        return ok, resp[:200]
+    except KeyError as e:
+        print(f"[SMS {SMS_PROVIDER} -> {phone}] FAILED: missing setting {e}")
+        return False, f"The setting {e} is missing in Vercel Environment Variables"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        print(f"[SMS {SMS_PROVIDER} -> {phone}] REJECTED: HTTP {e.code} {body}")
+        return False, (f2s_reason(body) if SMS_PROVIDER == "fast2sms" else f"HTTP {e.code}: {body[:200]}")
     except Exception as e:      # an SMS problem must never break booking or payment
         print(f"[SMS {SMS_PROVIDER} -> {phone}] FAILED: {e}")
+        return False, str(e)[:200]
 
 def notify(farmer_id, text):
     f = q("SELECT phone FROM farmers WHERE id=?", (farmer_id,), one=True)
@@ -447,19 +491,35 @@ def sms_test():
     need_staff()
     phone = norm_phone(body().get("phone"))
     if not phone: return jsonify(error="Enter a valid Indian mobile number"), 400
-    send_sms(phone, "Kisan Slot test: SMS notifications are working.")
-    return jsonify(message=f"Test SMS sent to +91 {phone} using '{SMS_PROVIDER}'. Check your phone.")
+    ok, detail = send_sms(phone, "Kisan Slot test: SMS notifications are working.")
+    if not ok: return jsonify(error=f"SMS was NOT sent. Reason from {SMS_PROVIDER}: {detail}"), 502
+    return jsonify(message=f"{SMS_PROVIDER} accepted the SMS for +91 {phone}. Reply from the gateway: {detail}. "
+                           "If it does not reach the phone in a minute, check Fast2SMS > Delivery Reports.")
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, version=4, db="postgres" if PG else "sqlite", sms=SMS_PROVIDER,
-                   staff_pin_is_default=(STAFF_PIN == "1234"))
+    return jsonify(ok=not STARTUP_ERROR, version=4, db="postgres" if PG else "sqlite", sms=SMS_PROVIDER,
+                   staff_pin_is_default=(STAFF_PIN == "1234"), setup_error=STARTUP_ERROR)
 
 @app.get("/")
 def home(): return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"}
 
 if not PRODUCTION: print(f"[STAFF] Centre staff PIN is: {STAFF_PIN}")
-init_db()      # also runs when Vercel imports the app
+if not STARTUP_ERROR:
+    try:
+        init_db()      # also runs when Vercel imports the app
+    except Exception as e:
+        print("[STARTUP ERROR]", repr(e))
+        STARTUP_ERROR = ("Cannot set up the database. Check that DATABASE_URL is the exact Neon connection string "
+                         "(starts with postgresql:// and ends with sslmode=require) with no spaces or quotes, then Redeploy. "
+                         "The exact error is in Vercel > Logs.")
+
+@app.before_request
+def _setup_guard():
+    if STARTUP_ERROR and request.path != "/api/health":
+        if request.path.startswith("/api/"): return jsonify(error=STARTUP_ERROR), 503
+        return ("<body style='font-family:sans-serif;max-width:560px;margin:40px auto'><h2>Kisan Slot is not set up yet</h2><p>"
+                + str(escape(STARTUP_ERROR)) + "</p></body>"), 503
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=not PRODUCTION)
