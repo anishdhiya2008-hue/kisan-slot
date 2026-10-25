@@ -1,0 +1,6 @@
+procure.db
+__pycache__/
+test_all.py
+run_windows.bat
+run_mac_linux.sh
+GUIDE.md
